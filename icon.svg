@@ -1,0 +1,29 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <!-- 背景：保持一致的深色圆角矩形 -->
+    <rect width="512" height="512" rx="100" fill="#171a21"/>
+    
+    <!-- 居中组 -->
+    <g transform="translate(256 270)">
+        
+        <!-- 连接线：三角形结构 -->
+        <!-- 顶点 (0, -130), 左下 (-110, 80), 右下 (110, 80) -->
+        <path d="M0 -130 L-110 80 L110 80 Z" 
+              stroke="#c7d5e0" 
+              stroke-width="70" 
+              stroke-linejoin="round"
+              stroke-linecap="round"/>
+        
+        <!-- 顶部节点 -->
+        <circle cx="0" cy="-130" r="55" fill="#c7d5e0" stroke="#171a21" stroke-width="20"/>
+        <circle cx="0" cy="-130" r="20" fill="#171a21"/>
+        
+        <!-- 左下节点 -->
+        <circle cx="-110" cy="80" r="55" fill="#c7d5e0" stroke="#171a21" stroke-width="20"/>
+        <circle cx="-110" cy="80" r="20" fill="#171a21"/>
+
+        <!-- 右下节点 -->
+        <circle cx="110" cy="80" r="55" fill="#c7d5e0" stroke="#171a21" stroke-width="20"/>
+        <circle cx="110" cy="80" r="20" fill="#171a21"/>
+        
+    </g>
+</svg>
