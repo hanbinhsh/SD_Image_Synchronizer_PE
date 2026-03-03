@@ -3,6 +3,7 @@ package com.ice.sd_image_synchronizer_pe
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -12,27 +13,30 @@ import androidx.core.app.NotificationCompat
 
 class SyncService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    private val CHANNEL_ID = "sd_sync_service"
+    private val NOTIFICATION_ID = 1
 
     override fun onCreate() {
         super.onCreate()
         SyncManager.init(this) // 确保单例被初始化
 
-        // 只要服务启动，就开启前台通知
-        startForegroundService()
+        // 注册回调，当 SyncManager 状态改变时更新通知
+        SyncManager.serviceStateCallback = {
+            updateNotification()
+        }
 
-        // 只有在开启了后台模式时，才申请 WakeLock (省电)
-        // 或者策略：只要服务活着就持有锁，通过 Stop Service 来彻底关闭
+        startForegroundService()
         acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.getStringExtra("ACTION")
-        if (action == "CONNECT") SyncManager.connect()
-        else if (action == "DISCONNECT") SyncManager.disconnect()
-
-        // 如果用户关闭了后台模式，且没有连接任务，这里可以考虑停止
-        // 但为了简单，我们由 SyncManager.setBackgroundMode 直接控制服务的存活
-
+        when (action) {
+            "CONNECT" -> SyncManager.connect()
+            "DISCONNECT" -> SyncManager.disconnect()
+        }
+        // 每次收到命令也尝试更新通知
+        updateNotification()
         return START_STICKY
     }
 
@@ -40,7 +44,7 @@ class SyncService : Service() {
         super.onDestroy()
         // 服务销毁时，释放锁，断开连接
         wakeLock?.release()
-        SyncManager.disconnect()
+        SyncManager.serviceStateCallback = null
     }
 
     private fun startForegroundService() {
@@ -49,21 +53,57 @@ class SyncService : Service() {
         manager.createNotificationChannel(
             NotificationChannel(channelId, "SD Sync Service", NotificationManager.IMPORTANCE_LOW)
         )
+        startForeground(NOTIFICATION_ID, buildNotification())
+    }
 
-        val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("SD 同步服务")
-            .setContentText("服务运行中...")
+    private fun updateNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun buildNotification(): Notification {
+        val isConnected = SyncManager.isConnected.value
+        val ip = SyncManager.serverIp.value
+
+        val title = if (isConnected) "SD Sync: 已连接" else "SD Sync: 未连接"
+        val content = if (isConnected) "正在与 $ip 同步" else "等待连接..."
+
+        // 打开 App 的 Intent
+        val contentIntent = Intent(this, MainActivity::class.java)
+        val pendingContentIntent = PendingIntent.getActivity(
+            this, 0, contentIntent, PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // 操作按钮 Intent
+        val actionIntent = Intent(this, SyncService::class.java).apply {
+            putExtra("ACTION", if (isConnected) "DISCONNECT" else "CONNECT")
+        }
+        val pendingActionIntent = PendingIntent.getService(
+            this,
+            if (isConnected) 2 else 3, // 不同的 RequestCode 避免冲突
+            actionIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val actionTitle = if (isConnected) "断开连接" else "连接"
+        // 图标：你可以换成具体的 drawable 资源
+        val actionIcon = if (isConnected) android.R.drawable.ic_menu_close_clear_cancel else android.R.drawable.ic_menu_add
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(content)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentIntent(pendingContentIntent)
+            .setOngoing(true) // 常驻
+            .addAction(actionIcon, actionTitle, pendingActionIntent)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
-
-        startForeground(1, notification)
     }
 
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SDSync::WakeLock")
-        // 设置一个较长的超时时间，或者不设置超时
         wakeLock?.acquire()
     }
 

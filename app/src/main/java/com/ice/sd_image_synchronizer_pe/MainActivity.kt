@@ -54,6 +54,12 @@ import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 
 fun encodeUrl(url: String): String {
     return try {
@@ -66,16 +72,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // [修复1] 设置窗口背景为纯黑，解决切换页面时的白屏闪烁
+        // 设置窗口背景为纯黑，解决切换页面时的白屏闪烁
         window.setBackgroundDrawableResource(android.R.color.black)
 
         // 初始化数据
         SyncManager.init(this)
-        startForegroundService(Intent(this, SyncService::class.java))
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                // [修复1] 根布局也加上黑色背景
                 Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
                     AppNavigation()
                 }
@@ -219,7 +223,7 @@ fun FolderListContent(navController: androidx.navigation.NavController) {
     } else {
         LazyVerticalGrid(
             columns = GridCells.Fixed(columns),
-            contentPadding = PaddingValues(8.dp),
+            contentPadding = PaddingValues(2.dp),
             modifier = Modifier.fillMaxSize()
         ) {
             items(rootContents.size) { index ->
@@ -253,8 +257,8 @@ fun FolderListContent(navController: androidx.navigation.NavController) {
 fun FolderItem(folder: File, onClick: () -> Unit) {
     Column(
         modifier = Modifier
-            .padding(4.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .padding(1.dp)
+            .clip(RectangleShape)
             .background(Color(0xFF252525))
             .clickable(onClick = onClick)
             .aspectRatio(1f), // 正方形
@@ -345,7 +349,7 @@ fun SubFolderScreen(navController: androidx.navigation.NavController, path: Stri
             } else {
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(columns),
-                    contentPadding = PaddingValues(8.dp),
+                    contentPadding = PaddingValues(2.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
                     items(contents.size) { index ->
@@ -559,6 +563,8 @@ fun ZoomableImage(
 @Composable
 fun SettingsScreen(navController: androidx.navigation.NavController) {
     var ip by remember { SyncManager.serverIp }
+    var port by remember { SyncManager.serverPort }
+    var aesKey by remember { SyncManager.aesKey }
     var autoConnect by remember { SyncManager.autoConnect }
     var autoReconnect by remember { SyncManager.autoReconnect }
     var backgroundMode by remember { SyncManager.backgroundMode }
@@ -573,6 +579,9 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
     // 临时路径输入变量
     var tempPath by remember { mutableStateOf("") }
 
+    // 记住滚动状态 (保留之前的修复)
+    val scrollState = rememberScrollState()
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -580,6 +589,7 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
                 title = { Text("设置") },
                 navigationIcon = {
                     IconButton(onClick = {
+                        // 虽然实时保存了，这里保留也没坏处
                         SyncManager.saveSettings()
                         navController.popBackStack()
                     }) {
@@ -589,25 +599,73 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp)) {
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .verticalScroll(scrollState)
+                .padding(16.dp)
+        ) {
 
             // --- 网络设置 ---
             Text("网络", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+
             OutlinedTextField(
                 value = ip,
-                onValueChange = { ip = it; SyncManager.serverIp.value = it },
+                onValueChange = {
+                    ip = it
+                    SyncManager.serverIp.value = it
+                    SyncManager.saveSettings() // [修改] 立即保存
+                },
                 label = { Text("电脑 IP 地址") },
                 modifier = Modifier.fillMaxWidth()
             )
-            SwitchItem("启动自动连接", autoConnect) { autoConnect = it; SyncManager.autoConnect.value = it }
-            SwitchItem("断线自动重连", autoReconnect) { autoReconnect = it; SyncManager.autoReconnect.value = it }
+
+            OutlinedTextField(
+                value = port,
+                onValueChange = {
+                    if (it.all { char -> char.isDigit() }) {
+                        port = it
+                        SyncManager.serverPort.value = it
+                        SyncManager.saveSettings() // [修改] 立即保存
+                    }
+                },
+                label = { Text("端口 (默认 12345)") },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            )
+
+            OutlinedTextField(
+                value = aesKey,
+                onValueChange = {
+                    aesKey = it
+                    SyncManager.aesKey.value = it
+                    SyncManager.saveSettings() // [修改] 立即保存
+                },
+                label = { Text("AES 密钥 (留空则不加密)") },
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            )
+
+            SwitchItem("启动自动连接", autoConnect) {
+                autoConnect = it
+                SyncManager.autoConnect.value = it
+                SyncManager.saveSettings() // [修改] 立即保存
+            }
+            SwitchItem("断线自动重连", autoReconnect) {
+                autoReconnect = it
+                SyncManager.autoReconnect.value = it
+                SyncManager.saveSettings() // [修改] 立即保存
+            }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 后台设置 (恢复的功能) ---
+            // --- 后台设置 ---
             Text("后台运行", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             SwitchItem("前台服务通知 & 防休眠", backgroundMode) {
                 SyncManager.setBackgroundMode(it)
+                // setBackgroundMode 内部已经调用了 saveSettings，所以这里不需要再调
             }
             Text(
                 "开启后将在通知栏显示常驻通知，并防止系统在后台断开网络连接。",
@@ -617,7 +675,7 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 存储设置 (恢复的功能) ---
+            // --- 存储设置 ---
             Text("存储", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             Text("当前路径:", style = MaterialTheme.typography.bodySmall)
             Text(currentPath, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
@@ -649,7 +707,14 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
             Text("网格列数: $columns")
             Slider(
                 value = columns.toFloat(),
-                onValueChange = { columns = it.toInt(); SyncManager.gridColumns.value = it.toInt() },
+                onValueChange = {
+                    columns = it.toInt()
+                    SyncManager.gridColumns.value = it.toInt()
+                },
+                // [修改] 增加这个回调，在手指松开时保存，避免拖动时疯狂写入硬盘
+                onValueChangeFinished = {
+                    SyncManager.saveSettings()
+                },
                 valueRange = 1f..10f,
                 steps = 9
             )
@@ -664,12 +729,12 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
             ) {
                 Text("清除所有缓存")
             }
+
+            Spacer(Modifier.height(16.dp))
         }
     }
 
-    // --- 弹窗逻辑 ---
-
-    // 1. 更改路径弹窗
+    // ... (后续的弹窗代码完全保持不变) ...
     if (showPathDialog) {
         AlertDialog(
             onDismissRequest = { showPathDialog = false },
@@ -689,9 +754,6 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
                     val success = SyncManager.changeStoragePath(tempPath)
                     if (success) {
                         showPathDialog = false
-                    } else {
-                        // 这里可以加一个 Toast 提示失败，或者简单的 Error 状态
-                        // 为了简单，暂时不做 UI 提示
                     }
                 }) { Text("确定移动") }
             },
@@ -701,7 +763,6 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
         )
     }
 
-    // 2. 恢复默认路径弹窗
     if (showResetDialog) {
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
@@ -719,7 +780,6 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
         )
     }
 
-    // 3. 清除缓存警告弹窗 (恢复的功能)
     if (showClearCacheDialog) {
         AlertDialog(
             onDismissRequest = { showClearCacheDialog = false },
