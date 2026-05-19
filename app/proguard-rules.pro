@@ -19,3 +19,10 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# 保护你的数据模型不被混淆
+-keep class com.ice.sd_image_synchronizer_pe.model.** { *; }
+
+# Gson 的基础保护规则
+-keep class sun.misc.Unsafe { *; }
+-keep class com.google.gson.stream.** { *; }

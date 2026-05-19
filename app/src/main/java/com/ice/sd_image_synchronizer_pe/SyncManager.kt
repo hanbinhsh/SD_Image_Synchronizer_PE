@@ -125,6 +125,8 @@ object SyncManager {
         if (!newDir.canWrite()) return false
 
         val oldDir = cacheDir
+        if (oldDir.absolutePath == newDir.absolutePath) return true
+
         scope.launch(Dispatchers.IO) {
             try {
                 oldDir.copyRecursively(newDir, overwrite = true)
@@ -133,7 +135,16 @@ object SyncManager {
                 currentStoragePath.value = newDir.absolutePath
                 saveSettings()
                 withContext(Dispatchers.Main) { refreshAllData() }
-            } catch (e: Exception) { Log.e("Sync", "Move failed: ${e.message}") }
+            } catch (e: Exception) {
+                Log.e("Sync", "Move failed: ${e.message}")
+            } finally {
+                // 关键修复：即使由于 Scoped Storage 限制导致旧文件拷贝报错
+                // 依然需要强制完成缓存目录的重定向，否则永远读取不到目标文件夹
+                cacheDir = newDir
+                currentStoragePath.value = newDir.absolutePath
+                saveSettings()
+                withContext(Dispatchers.Main) { refreshAllData() }
+            }
         }
         return true
     }
@@ -144,6 +155,7 @@ object SyncManager {
     }
 
     fun refreshAllData() {
+        if (!::cacheDir.isInitialized) return // 防止 MainActivity onResume 在 init 完成前调用造成崩溃
         val folders = cacheDir.listFiles { file -> file.isDirectory }?.sortedBy { it.name } ?: emptyList()
         folderList.clear()
         folderList.addAll(folders)
@@ -155,7 +167,10 @@ object SyncManager {
     }
 
     private fun isImageFile(name: String): Boolean {
-        return name.endsWith(".jpg", true) || name.endsWith(".png", true) || name.endsWith(".webp", true)
+        return name.endsWith(".jpg", true) ||
+                name.endsWith(".jpeg", true) || // 增加 .jpeg 支持
+                name.endsWith(".png", true) ||
+                name.endsWith(".webp", true)
     }
 
 
