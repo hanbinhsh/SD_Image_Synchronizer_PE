@@ -9,8 +9,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -60,6 +62,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import kotlinx.coroutines.launch
 
 fun encodeUrl(url: String): String {
     return try {
@@ -75,36 +78,17 @@ class MainActivity : ComponentActivity() {
         // 设置窗口背景为纯黑，解决切换页面时的白屏闪烁
         window.setBackgroundDrawableResource(android.R.color.black)
 
-        // --- 新增：申请文件管理权限，解决重装后无法跨 UID 读取原文件夹内容 ---
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                    intent.data = Uri.parse("package:$packageName")
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                    startActivity(intent)
-                }
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED ||
-                ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE),
-                    100
-                )
-            }
-        }
-
         // 初始化数据
         SyncManager.init(this)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
-                    AppNavigation()
+                    PermissionAwareApp(
+                        hasFileAccessPermission = ::hasFileAccessPermission,
+                        fileAccessSettingsIntent = ::fileAccessSettingsIntent,
+                        hasNotificationPermission = ::hasNotificationPermission
+                    )
                 }
             }
         }
@@ -113,6 +97,31 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // 关键：当用户从系统设置页面授予权限并返回应用时，立刻刷新数据
         SyncManager.refreshAllData()
+    }
+
+    private fun hasFileAccessPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun fileAccessSettingsIntent(): Intent {
+        val appSettingsIntent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        return if (appSettingsIntent.resolveActivity(packageManager) != null) {
+            appSettingsIntent
+        } else {
+            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+        }
+    }
+
+    private fun hasNotificationPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     }
 }
 
@@ -127,7 +136,100 @@ object Routes {
 }
 
 @Composable
-fun AppNavigation() {
+fun PermissionAwareApp(
+    hasFileAccessPermission: () -> Boolean,
+    fileAccessSettingsIntent: () -> Intent,
+    hasNotificationPermission: () -> Boolean
+) {
+    var showFileAccessDialog by remember { mutableStateOf(!hasFileAccessPermission()) }
+    var fileAccessSettingsOpened by remember { mutableStateOf(false) }
+    var pendingEnableBackgroundMode by remember { mutableStateOf(false) }
+    var showNotificationPermissionDialog by remember { mutableStateOf(false) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && pendingEnableBackgroundMode) {
+            SyncManager.setBackgroundMode(true)
+        }
+        pendingEnableBackgroundMode = false
+    }
+
+    val fileAccessSettingsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        showFileAccessDialog = !hasFileAccessPermission()
+    }
+
+    LaunchedEffect(fileAccessSettingsOpened) {
+        if (fileAccessSettingsOpened && hasFileAccessPermission()) {
+            showFileAccessDialog = false
+        }
+    }
+
+    AppNavigation(
+        hasNotificationPermission = hasNotificationPermission,
+        requestNotificationPermission = {
+            pendingEnableBackgroundMode = true
+            showNotificationPermissionDialog = true
+        }
+    )
+
+    if (showFileAccessDialog) {
+        AlertDialog(
+            onDismissRequest = { showFileAccessDialog = false },
+            title = { Text("需要文件访问权限") },
+            text = { Text("应用需要读取和管理同步图片缓存目录，否则无法正常显示和保存同步图片。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    fileAccessSettingsOpened = true
+                    showFileAccessDialog = false
+                    fileAccessSettingsLauncher.launch(fileAccessSettingsIntent())
+                }) {
+                    Text("去授权")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showFileAccessDialog = false }) {
+                    Text("稍后")
+                }
+            }
+        )
+    }
+
+    if (showNotificationPermissionDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showNotificationPermissionDialog = false
+                pendingEnableBackgroundMode = false
+            },
+            title = { Text("需要通知权限") },
+            text = { Text("开启前台服务后，应用需要在通知栏显示同步状态，防止系统在后台断开连接。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showNotificationPermissionDialog = false
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }) {
+                    Text("允许通知")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showNotificationPermissionDialog = false
+                    pendingEnableBackgroundMode = false
+                }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun AppNavigation(
+    hasNotificationPermission: () -> Boolean,
+    requestNotificationPermission: () -> Unit
+) {
     val navController = rememberNavController()
 
     NavHost(navController, startDestination = Routes.HOME) {
@@ -177,7 +279,13 @@ fun AppNavigation() {
             ViewerScreen(navController, mode, index, path)
         }
 
-        composable(Routes.SETTINGS) { SettingsScreen(navController) }
+        composable(Routes.SETTINGS) {
+            SettingsScreen(
+                navController,
+                hasNotificationPermission = hasNotificationPermission,
+                requestNotificationPermission = requestNotificationPermission
+            )
+        }
     }
 }
 
@@ -188,6 +296,12 @@ fun HomeScreen(navController: androidx.navigation.NavController) {
     val isConnected by SyncManager.isConnected
     var selectedTab by rememberSaveable { mutableStateOf(0) }
     val tabs = listOf("文件夹", "全部图片")
+    val pagerState = rememberPagerState(initialPage = selectedTab, pageCount = { tabs.size })
+    val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(pagerState.currentPage) {
+        selectedTab = pagerState.currentPage
+    }
 
     Scaffold(
         topBar = {
@@ -218,7 +332,12 @@ fun HomeScreen(navController: androidx.navigation.NavController) {
                     tabs.forEachIndexed { index, title ->
                         Tab(
                             selected = selectedTab == index,
-                            onClick = { selectedTab = index },
+                            onClick = {
+                                selectedTab = index
+                                coroutineScope.launch {
+                                    pagerState.animateScrollToPage(index)
+                                }
+                            },
                             text = { Text(title) }
                         )
                     }
@@ -226,11 +345,15 @@ fun HomeScreen(navController: androidx.navigation.NavController) {
             }
         }
     ) { padding ->
-        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-            if (selectedTab == 0) {
-                FolderListContent(navController)
-            } else {
-                AllImagesContent(navController)
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+        ) { page ->
+            when (page) {
+                0 -> FolderListContent(navController)
+                1 -> AllImagesContent(navController)
             }
         }
     }
@@ -590,7 +713,11 @@ fun ZoomableImage(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(navController: androidx.navigation.NavController) {
+fun SettingsScreen(
+    navController: androidx.navigation.NavController,
+    hasNotificationPermission: () -> Boolean,
+    requestNotificationPermission: () -> Unit
+) {
     var ip by remember { SyncManager.serverIp }
     var port by remember { SyncManager.serverPort }
     var aesKey by remember { SyncManager.aesKey }
@@ -604,6 +731,9 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
     var showPathDialog by remember { mutableStateOf(false) }
     var showResetDialog by remember { mutableStateOf(false) }
     var showClearCacheDialog by remember { mutableStateOf(false) }
+    var ipDropdownExpanded by remember { mutableStateOf(false) }
+    val discoveredServers = SyncManager.discoveredServers
+    val isDiscoveringServers by SyncManager.isDiscoveringServers
 
     // 临时路径输入变量
     var tempPath by remember { mutableStateOf("") }
@@ -639,16 +769,64 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
             // --- 网络设置 ---
             Text("网络", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
 
-            OutlinedTextField(
-                value = ip,
-                onValueChange = {
-                    ip = it
-                    SyncManager.serverIp.value = it
-                    SyncManager.saveSettings() // [修改] 立即保存
+            ExposedDropdownMenuBox(
+                expanded = ipDropdownExpanded,
+                onExpandedChange = { expanded ->
+                    ipDropdownExpanded = expanded
+                    if (expanded) {
+                        SyncManager.discoverSyncServers()
+                    }
                 },
-                label = { Text("电脑 IP 地址") },
                 modifier = Modifier.fillMaxWidth()
-            )
+            ) {
+                OutlinedTextField(
+                    value = ip,
+                    onValueChange = {
+                        ip = it
+                        SyncManager.serverIp.value = it
+                        SyncManager.saveSettings() // [修改] 立即保存
+                    },
+                    label = { Text("电脑 IP 地址") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = ipDropdownExpanded) },
+                    singleLine = true,
+                    modifier = Modifier
+                        .menuAnchor()
+                        .fillMaxWidth()
+                )
+
+                ExposedDropdownMenu(
+                    expanded = ipDropdownExpanded,
+                    onDismissRequest = { ipDropdownExpanded = false }
+                ) {
+                    if (isDiscoveringServers) {
+                        DropdownMenuItem(
+                            text = { Text("正在搜索...") },
+                            onClick = {},
+                            enabled = false
+                        )
+                    } else if (discoveredServers.isEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text("未发现服务") },
+                            onClick = {},
+                            enabled = false
+                        )
+                    } else {
+                        discoveredServers.forEach { server ->
+                            DropdownMenuItem(
+                                text = { Text("${server.name} (${server.ip}:${server.port})") },
+                                onClick = {
+                                    ip = server.ip
+                                    port = server.port.toString()
+                                    SyncManager.serverIp.value = server.ip
+                                    SyncManager.serverPort.value = server.port.toString()
+                                    SyncManager.saveSettings()
+                                    ipDropdownExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             OutlinedTextField(
                 value = port,
@@ -693,8 +871,12 @@ fun SettingsScreen(navController: androidx.navigation.NavController) {
             // --- 后台设置 ---
             Text("后台运行", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             SwitchItem("前台服务通知 & 防休眠", backgroundMode) {
-                SyncManager.setBackgroundMode(it)
-                // setBackgroundMode 内部已经调用了 saveSettings，所以这里不需要再调
+                if (it && !hasNotificationPermission()) {
+                    requestNotificationPermission()
+                } else {
+                    SyncManager.setBackgroundMode(it)
+                    // setBackgroundMode 内部已经调用了 saveSettings，所以这里不需要再调
+                }
             }
             Text(
                 "开启后将在通知栏显示常驻通知，并防止系统在后台断开网络连接。",

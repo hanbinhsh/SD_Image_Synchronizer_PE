@@ -13,7 +13,12 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.UUID
@@ -27,6 +32,8 @@ object SyncManager {
     var isConnected = mutableStateOf(false)
     var logText = mutableStateOf("就绪")
     var isUserDisconnect = false
+    var isDiscoveringServers = mutableStateOf(false)
+    var discoveredServers = mutableStateListOf<DiscoveredSyncServer>()
 
     // 数据源
     var allFiles = mutableStateListOf<File>()
@@ -54,6 +61,12 @@ object SyncManager {
     private lateinit var deviceId: String
 
     var serviceStateCallback: (() -> Unit)? = null
+
+    data class DiscoveredSyncServer(
+        val name: String,
+        val ip: String,
+        val port: Int
+    )
 
     fun init(context: Context) {
         if (isInitialized) return
@@ -107,6 +120,88 @@ object SyncManager {
         return targetDir.listFiles { f -> f.isFile && isImageFile(f.name) }
             ?.sortedByDescending { it.lastModified() }
             ?.toList() ?: emptyList()
+    }
+
+    fun discoverSyncServers() {
+        if (isDiscoveringServers.value) return
+
+        scope.launch {
+            val discovered = linkedMapOf<String, DiscoveredSyncServer>()
+            val port = serverPort.value.toIntOrNull() ?: 12345
+
+            withContext(Dispatchers.Main) {
+                isDiscoveringServers.value = true
+                discoveredServers.clear()
+            }
+
+            try {
+                DatagramSocket().use { socket ->
+                    socket.broadcast = true
+                    socket.soTimeout = 1500
+
+                    val request = JSONObject()
+                        .put("cmd", "SD_SYNC_DISCOVER")
+                        .put("version", 1)
+                        .put("client", "android")
+                        .toString()
+                        .toByteArray(StandardCharsets.UTF_8)
+
+                    getBroadcastAddresses().forEach { address ->
+                        try {
+                            socket.send(DatagramPacket(request, request.size, address, port))
+                        } catch (e: Exception) {
+                            Log.w("Sync", "Discovery send failed: ${e.message}")
+                        }
+                    }
+
+                    val buffer = ByteArray(2048)
+                    while (true) {
+                        try {
+                            val packet = DatagramPacket(buffer, buffer.size)
+                            socket.receive(packet)
+                            val json = JSONObject(String(packet.data, packet.offset, packet.length, StandardCharsets.UTF_8))
+                            if (json.optString("cmd") != "SD_SYNC_DISCOVER_RESPONSE") continue
+                            if (json.optInt("version") != 1) continue
+                            if (json.optString("app") != "SD_LoRA_Manager") continue
+
+                            val ip = json.optString("ip").ifBlank { packet.address.hostAddress ?: "" }
+                            val responsePort = json.optInt("port", port)
+                            if (ip.isBlank() || responsePort <= 0) continue
+
+                            val name = json.optString("name").ifBlank { ip }
+                            discovered["$ip:$responsePort"] = DiscoveredSyncServer(name, ip, responsePort)
+                        } catch (_: SocketTimeoutException) {
+                            break
+                        } catch (e: Exception) {
+                            Log.w("Sync", "Discovery response ignored: ${e.message}")
+                        }
+                    }
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    discoveredServers.clear()
+                    discoveredServers.addAll(discovered.values)
+                    isDiscoveringServers.value = false
+                }
+            }
+        }
+    }
+
+    private fun getBroadcastAddresses(): List<InetAddress> {
+        val addresses = linkedSetOf<InetAddress>()
+        addresses.add(InetAddress.getByName("255.255.255.255"))
+
+        try {
+            NetworkInterface.getNetworkInterfaces()?.asSequence()
+                ?.filter { it.isUp && !it.isLoopback }
+                ?.flatMap { it.interfaceAddresses.asSequence() }
+                ?.mapNotNull { it.broadcast }
+                ?.forEach { addresses.add(it) }
+        } catch (e: Exception) {
+            Log.w("Sync", "Broadcast address lookup failed: ${e.message}")
+        }
+
+        return addresses.toList()
     }
 
     private fun startService() {
