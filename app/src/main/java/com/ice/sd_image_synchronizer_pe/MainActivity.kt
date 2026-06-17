@@ -2,6 +2,7 @@ package com.ice.sd_image_synchronizer_pe
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -12,9 +13,13 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,9 +38,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -75,8 +82,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 全面屏：内容延伸到系统栏下方
+        enableEdgeToEdge()
+
         // 设置窗口背景为纯黑，解决切换页面时的白屏闪烁
         window.setBackgroundDrawableResource(android.R.color.black)
+
+        // 深色界面：状态栏/导航栏图标使用浅色，保证可见
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
 
         // 初始化数据
         SyncManager.init(this)
@@ -292,34 +308,53 @@ fun AppNavigation(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(navController: androidx.navigation.NavController) {
-    val context = LocalContext.current
     val isConnected by SyncManager.isConnected
+    val isConnecting by SyncManager.isConnecting
+    val logText by SyncManager.logText
     var selectedTab by rememberSaveable { mutableStateOf(0) }
     val tabs = listOf("文件夹", "全部图片")
     val pagerState = rememberPagerState(initialPage = selectedTab, pageCount = { tabs.size })
     val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(pagerState.currentPage) {
         selectedTab = pagerState.currentPage
     }
 
+    // 连接状态变化时用 Snackbar 反馈（跳过首次的初始状态）
+    var lastLog by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(logText) {
+        if (lastLog != null && logText != lastLog) {
+            snackbarHostState.showSnackbar(logText)
+        }
+        lastLog = logText
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column {
                 TopAppBar(
                     title = { Text("SD Sync") },
                     actions = {
-                        // 连接按钮
-                        IconButton(onClick = {
-                            val intent = Intent(context, SyncService::class.java)
-                            intent.putExtra("ACTION", if (isConnected) "DISCONNECT" else "CONNECT")
-                            context.startForegroundService(intent)
-                        }) {
-                            Icon(
-                                imageVector = if (isConnected) Icons.Default.Link else Icons.Default.LinkOff,
-                                contentDescription = "Connect",
-                                tint = if (isConnected) Color.Green else Color.Red
-                            )
+                        // 连接按钮：连接中显示进度，避免无反馈
+                        IconButton(
+                            onClick = { SyncManager.toggleConnection() },
+                            enabled = !isConnecting
+                        ) {
+                            if (isConnecting) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    strokeWidth = 2.dp,
+                                    color = Color.White
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = if (isConnected) Icons.Default.Link else Icons.Default.LinkOff,
+                                    contentDescription = "Connect",
+                                    tint = if (isConnected) Color.Green else Color.Red
+                                )
+                            }
                         }
                         // 设置按钮
                         IconButton(onClick = { navController.navigate(Routes.SETTINGS) }) {
@@ -370,7 +405,7 @@ fun FolderListContent(navController: androidx.navigation.NavController) {
     val columns by SyncManager.gridColumns
 
     if (rootContents.isEmpty()) {
-        EmptyState("空文件夹")
+        NoImagesState(navController)
     } else {
         LazyVerticalGrid(
             columns = GridCells.Fixed(columns),
@@ -386,10 +421,8 @@ fun FolderListContent(navController: androidx.navigation.NavController) {
                     }
                 } else {
                     // 根目录下的图片
-                    AsyncImage(
-                        model = file,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
+                    ThumbnailImage(
+                        file = file,
                         modifier = Modifier
                             .aspectRatio(1f)
                             .padding(1.dp)
@@ -441,7 +474,7 @@ fun AllImagesContent(navController: androidx.navigation.NavController) {
     val columns by SyncManager.gridColumns
 
     if (images.isEmpty()) {
-        EmptyState("暂无图片")
+        NoImagesState(navController)
     } else {
         ImageGrid(images, columns) { index ->
             navController.navigate("viewer/all/$index?path=")
@@ -459,13 +492,8 @@ fun ImageGrid(images: List<File>, columns: Int, onClick: (Int) -> Unit) {
     ) {
         items(images.size) { index ->
             val file = images[index]
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(file)
-                    .crossfade(true)
-                    .build(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
+            ThumbnailImage(
+                file = file,
                 modifier = Modifier
                     .aspectRatio(1f)
                     .padding(1.dp)
@@ -513,10 +541,8 @@ fun SubFolderScreen(navController: androidx.navigation.NavController, path: Stri
                             }
                         } else {
                             // 显示图片
-                            AsyncImage(
-                                model = file,
-                                contentDescription = null,
-                                contentScale = ContentScale.Crop,
+                            ThumbnailImage(
+                                file = file,
                                 modifier = Modifier
                                     .aspectRatio(1f)
                                     .padding(1.dp)
@@ -570,6 +596,32 @@ fun ViewerScreen(
 
     // 依然保留状态，但不再用于锁定 Pager，可用于其他 UI 逻辑（如显示缩放比例提示等）
     var isZoomed by remember { mutableStateOf(false) }
+
+    // 跟随 showUi 同步显示/隐藏系统状态栏和导航栏（沉浸式大图模式）
+    val view = LocalView.current
+    val window = remember(view) { (view.context as? Activity)?.window }
+    LaunchedEffect(showUi, window) {
+        window?.let {
+            val controller = WindowCompat.getInsetsController(it, view)
+            // 隐藏后用户可从屏幕边缘滑动临时唤出系统栏
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (showUi) {
+                controller.show(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+    // 离开大图页面时恢复系统栏，避免影响其他界面
+    DisposableEffect(window) {
+        onDispose {
+            window?.let {
+                WindowCompat.getInsetsController(it, view)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -626,6 +678,63 @@ fun ViewerScreen(
 fun EmptyState(msg: String) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Text(msg, color = Color.Gray, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+// 统一的缩略图组件：加载中显示占位色，失败显示错误占位色，避免黑块闪烁
+@Composable
+fun ThumbnailImage(file: File, modifier: Modifier = Modifier) {
+    AsyncImage(
+        model = ImageRequest.Builder(LocalContext.current)
+            .data(file)
+            .crossfade(true)
+            .build(),
+        contentDescription = null,
+        contentScale = ContentScale.Crop,
+        placeholder = ColorPainter(Color(0xFF1E1E1E)),
+        error = ColorPainter(Color(0xFF2A1E1E)),
+        modifier = modifier
+    )
+}
+
+// 空状态引导：未连接时提示并提供前往设置的入口
+@Composable
+fun NoImagesState(navController: androidx.navigation.NavController) {
+    val isConnected by SyncManager.isConnected
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = if (isConnected) Icons.Default.HourglassEmpty else Icons.Default.CloudOff,
+            contentDescription = null,
+            tint = Color.Gray,
+            modifier = Modifier.size(56.dp)
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            if (isConnected) "已连接，等待图片同步…" else "还没有图片",
+            color = Color.Gray,
+            style = MaterialTheme.typography.bodyLarge
+        )
+        if (!isConnected) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "连接电脑端后，图片会自动同步到这里",
+                color = Color.Gray,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+            Spacer(Modifier.height(16.dp))
+            OutlinedButton(onClick = { navController.navigate(Routes.SETTINGS) }) {
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("前往设置连接")
+            }
+        }
     }
 }
 
@@ -737,6 +846,8 @@ fun SettingsScreen(
 
     // 临时路径输入变量
     var tempPath by remember { mutableStateOf("") }
+    // AES 密钥显隐切换
+    var aesKeyVisible by remember { mutableStateOf(false) }
 
     // 记住滚动状态 (保留之前的修复)
     val scrollState = rememberScrollState()
@@ -850,7 +961,19 @@ fun SettingsScreen(
                     SyncManager.saveSettings() // [修改] 立即保存
                 },
                 label = { Text("AES 密钥 (留空则不加密)") },
-                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                singleLine = true,
+                visualTransformation = if (aesKeyVisible)
+                    androidx.compose.ui.text.input.VisualTransformation.None
+                else
+                    androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { aesKeyVisible = !aesKeyVisible }) {
+                        Icon(
+                            imageVector = if (aesKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (aesKeyVisible) "隐藏密钥" else "显示密钥"
+                        )
+                    }
+                },
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
             )

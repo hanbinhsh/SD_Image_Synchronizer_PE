@@ -3,6 +3,7 @@ package com.ice.sd_image_synchronizer_pe
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
@@ -30,6 +31,7 @@ import java.util.Arrays
 object SyncManager {
     // --- UI 状态 ---
     var isConnected = mutableStateOf(false)
+    var isConnecting = mutableStateOf(false) // 连接/认证进行中，用于 UI 反馈
     var logText = mutableStateOf("就绪")
     var isUserDisconnect = false
     var isDiscoveringServers = mutableStateOf(false)
@@ -53,6 +55,8 @@ object SyncManager {
     private var isInitialized = false
     private var socket: Socket? = null
     private var job: Job? = null
+    private var refreshJob: Job? = null // 用于合并多次刷新请求
+    private var wakeLock: PowerManager.WakeLock? = null // 仅在传输期间持有
     private val scope = CoroutineScope(Dispatchers.IO)
     private lateinit var appContext: Context
     private lateinit var cacheDir: File
@@ -214,6 +218,41 @@ object SyncManager {
         appContext.stopService(intent)
     }
 
+    // 由 UI 触发连接/断开：开启后台模式时走前台服务（常驻），否则直接在进程内连接（不弹常驻通知）
+    fun toggleConnection() {
+        if (isConnected.value || isConnecting.value) {
+            if (backgroundMode.value) sendServiceAction("DISCONNECT") else disconnect()
+        } else {
+            if (backgroundMode.value) sendServiceAction("CONNECT") else connect()
+        }
+    }
+
+    private fun sendServiceAction(action: String) {
+        val intent = Intent(appContext, SyncService::class.java).putExtra("ACTION", action)
+        appContext.startForegroundService(intent)
+    }
+
+    // 仅在数据传输期间持有防休眠锁，并设置超时；空闲后自动释放，避免 7x24 常驻耗电
+    private fun acquireTransferLock() {
+        if (!::appContext.isInitialized) return
+        if (wakeLock == null) {
+            val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SDSync::Transfer").apply {
+                setReferenceCounted(false)
+            }
+        }
+        // 3 分钟超时；持续有数据会不断续期，空闲后由系统自动释放
+        wakeLock?.acquire(3 * 60 * 1000L)
+    }
+
+    private fun releaseTransferLock() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (e: Exception) {
+            Log.w("Sync", "WakeLock release failed: ${e.message}")
+        }
+    }
+
     fun changeStoragePath(newPath: String): Boolean {
         val newDir = File(newPath)
         if (!newDir.exists()) { if (!newDir.mkdirs()) return false }
@@ -249,16 +288,38 @@ object SyncManager {
         changeStoragePath(defaultDir.absolutePath)
     }
 
+    // 立即刷新（磁盘遍历在 IO 线程执行，不阻塞主线程）
     fun refreshAllData() {
         if (!::cacheDir.isInitialized) return // 防止 MainActivity onResume 在 init 完成前调用造成崩溃
-        val folders = cacheDir.listFiles { file -> file.isDirectory }?.sortedBy { it.name } ?: emptyList()
-        folderList.clear()
-        folderList.addAll(folders)
-        val images = mutableListOf<File>()
-        cacheDir.walk().filter { it.isFile && isImageFile(it.name) }.forEach { images.add(it) }
-        images.sortByDescending { it.lastModified() }
-        allFiles.clear()
-        allFiles.addAll(images)
+        refreshJob?.cancel()
+        refreshJob = scope.launch { reloadFromDisk() }
+    }
+
+    // 流式同步时调用：合并 300ms 内的多次请求，避免每收到一张图就做一次全盘扫描
+    private fun scheduleRefresh() {
+        if (!::cacheDir.isInitialized) return
+        refreshJob?.cancel()
+        refreshJob = scope.launch {
+            delay(300)
+            reloadFromDisk()
+        }
+    }
+
+    private suspend fun reloadFromDisk() {
+        // 磁盘遍历放在 IO 线程，避免阻塞主线程造成卡顿/ANR
+        val (folders, images) = withContext(Dispatchers.IO) {
+            val folders = cacheDir.listFiles { file -> file.isDirectory }?.sortedBy { it.name } ?: emptyList()
+            val images = cacheDir.walk().filter { it.isFile && isImageFile(it.name) }.toMutableList()
+            images.sortByDescending { it.lastModified() }
+            Pair(folders, images)
+        }
+        // 仅在主线程更新 Compose 状态列表
+        withContext(Dispatchers.Main) {
+            folderList.clear()
+            folderList.addAll(folders)
+            allFiles.clear()
+            allFiles.addAll(images)
+        }
     }
 
     private fun isImageFile(name: String): Boolean {
@@ -276,12 +337,14 @@ object SyncManager {
 
         job = scope.launch {
             try {
+                isConnecting.value = true
                 val port = serverPort.value.toIntOrNull() ?: 12345
                 logText.value = "正在连接 ${serverIp.value}:$port..."
                 serviceStateCallback?.invoke()
 
                 socket = Socket(serverIp.value, port)
                 socket?.keepAlive = true
+                acquireTransferLock()
 
                 val input = DataInputStream(socket!!.getInputStream())
                 val output = DataOutputStream(socket!!.getOutputStream())
@@ -290,6 +353,7 @@ object SyncManager {
                 sendAuth(output)
 
                 isConnected.value = true
+                isConnecting.value = false
                 logText.value = "已连接，正在认证..."
                 serviceStateCallback?.invoke()
 
@@ -336,12 +400,16 @@ object SyncManager {
                         dis.readFully(dataBytes)
                     }
 
+                    // 有数据到达就续期防休眠锁；空闲超过超时后自动释放，避免常驻耗电
+                    acquireTransferLock()
                     handleCommand(jsonStr, dataBytes, output)
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) return@launch
                 Log.e("Sync", "Connection error", e)
                 isConnected.value = false
+                isConnecting.value = false
+                releaseTransferLock()
                 logText.value = "断开: ${e.message}"
                 socket = null
                 serviceStateCallback?.invoke()
@@ -371,19 +439,19 @@ object SyncManager {
                     val targetFile = File(cacheDir, relPath)
                     targetFile.parentFile?.mkdirs()
                     FileOutputStream(targetFile).use { it.write(data) }
-                    scope.launch(Dispatchers.Main) { refreshAllData() }
+                    scheduleRefresh()
                 }
                 "DELETE" -> {
                     val relPath = json.optString("path")
                     val targetFile = File(cacheDir, relPath)
                     if (targetFile.exists()) targetFile.delete()
-                    scope.launch(Dispatchers.Main) { refreshAllData() }
+                    scheduleRefresh()
                 }
                 "DELETE_FOLDER" -> {
                     val relPath = json.optString("path")
                     val targetFile = File(cacheDir, relPath)
                     if (targetFile.exists()) targetFile.deleteRecursively()
-                    scope.launch(Dispatchers.Main) { refreshAllData() }
+                    scheduleRefresh()
                 }
             }
         } catch (e: Exception) {
@@ -519,14 +587,19 @@ object SyncManager {
         isUserDisconnect = true
         try { socket?.close() } catch (e: Exception) {}
         isConnected.value = false
+        isConnecting.value = false
+        releaseTransferLock()
         job?.cancel()
         serviceStateCallback?.invoke()
     }
 
     fun clearCache() {
-        cacheDir.deleteRecursively()
-        cacheDir.mkdirs()
-        refreshAllData()
+        // 删除整个缓存目录可能较慢，放到 IO 线程执行
+        scope.launch {
+            cacheDir.deleteRecursively()
+            cacheDir.mkdirs()
+            reloadFromDisk()
+        }
     }
 
     // 设置存取

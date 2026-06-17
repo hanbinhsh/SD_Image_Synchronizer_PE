@@ -5,14 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 class SyncService : Service() {
-    private var wakeLock: PowerManager.WakeLock? = null
     private val CHANNEL_ID = "sd_sync_service"
     private val NOTIFICATION_ID = 1
 
@@ -26,7 +23,6 @@ class SyncService : Service() {
         }
 
         startForegroundService()
-        acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -42,8 +38,6 @@ class SyncService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // 服务销毁时，释放锁，断开连接
-        wakeLock?.release()
         SyncManager.serviceStateCallback = null
     }
 
@@ -98,13 +92,6 @@ class SyncService : Service() {
             .addAction(actionIcon, actionTitle, pendingActionIntent)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
-    }
-
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SDSync::WakeLock")
-        wakeLock?.acquire()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
